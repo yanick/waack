@@ -10,7 +10,6 @@ use SQL::Translator;
 use Clone 'clone';
 
 use Dancer;
-use Dancer::Plugin::DBIC;
 
 config->{engines}{JSON} = {
     convert_blessed => 1,
