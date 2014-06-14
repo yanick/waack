@@ -1,0 +1,113 @@
+#TODO: discover schema
+
+# params can be in the body, or in the url
+
+
+#use 5.20.0;
+
+#use experimental 'signatures', 'postderef';
+
+use Dancer;
+
+use List::AllUtils qw/ zip /;
+
+config->{engines}{JSON}{convert_blessed} = 1;
+config->{engines}{JSON}{allow_blessed} = 1;
+set serializer => 'JSON';
+set logger => 'console';
+set log => 'core';
+set show_errors => 1;
+
+{ package Waack::DB; use parent 'DBIx::Class::Schema::Loader'; 
+__PACKAGE__->naming('current'); 
+__PACKAGE__->use_namespaces(1); 
+__PACKAGE__->loader_options( components => [ 'Helper::Row::ToJSON' ]);
+}
+
+my $schema = Waack::DB->connect( 'dbi:SQLite:foo.db' );
+
+# serialize ALL THE THINGS
+for my $column ( map {values %{ $_->columns_info} } map { $schema->source($_) } $schema->sources ) {
+    $column->{is_serializable} = 1;
+}
+
+create_routes_for_table( $schema, $_ ) for $schema->sources;
+
+get '/_tables' => sub {
+    return [ $schema->sources ];
+};
+
+use SQL::Translator;
+
+get '/_schema.html' => sub {
+    my $trans  = SQL::Translator->new (
+        parser      => 'SQL::Translator::Parser::DBIx::Class',
+        parser_args => {
+         dbic_schema => $schema,
+     },
+     producer    => 'HTML',
+    ) or die SQL::Translator->error;
+
+    return $trans->translate || die $trans->error;
+};
+
+get '/_schema' => sub {
+    header 'Content-Type' => 'application/json';
+
+    my $trans  = SQL::Translator->new (
+        parser      => 'SQL::Translator::Parser::DBIx::Class',
+        parser_args => {
+         dbic_schema => $schema,
+     },
+     producer    => 'JSON',
+    ) or die SQL::Translator->error;
+
+    return $trans->translate || die $trans->error;
+};
+
+sub create_routes_for_table {
+my ( $schema, $table ) = @_;
+    my @primary_key = $schema->source($table)->primary_columns;
+
+    # will be /<table name>/<key 1>/<key 2>
+    my $row_url = join '/', undef, $table, ( '*' ) x @primary_key;
+
+    get "/$table" => sub {
+        my @things = $schema->resultset($table)->search({ params() })->all;
+        return \@things;
+    };
+
+    get "/$table/_schema" => sub {
+        # TODO clone
+        my %columns = %{ $schema->source($table)->columns_info };
+        for my $c ( values %columns ) {
+            /^_/ and delete $c->{$_} for keys %$c;
+        }
+        \%columns;
+    };
+
+    get $row_url => sub {
+        my @ids = splat;
+        return $schema->resultset($table)->find({
+            zip @primary_key, @ids
+        });
+    };
+
+    post "/$table" => sub {
+        $schema->resultset($table)->create({ params() });
+    };
+
+    put $row_url => sub {
+        my @ids = splat;
+        delete params->{splat};
+        my $row = $schema->resultset($table)->find({
+            zip @primary_key, @ids
+        });
+        $row->update({ params() });
+        $row;
+    };
+
+}
+
+dance;
+
