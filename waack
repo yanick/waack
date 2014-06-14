@@ -1,72 +1,64 @@
-#TODO: discover schema
+#!/usr/bin/env perl
 
-# params can be in the body, or in the url
+# usage: waack <dsn> <user> <password>
+use 5.20.0;
 
-
-#use 5.20.0;
-
-#use experimental 'signatures', 'postderef';
-
-use Dancer;
+use experimental 'signatures', 'postderef';
 
 use List::AllUtils qw/ zip /;
+use SQL::Translator;
+use Clone 'clone';
 
-config->{engines}{JSON}{convert_blessed} = 1;
-config->{engines}{JSON}{allow_blessed} = 1;
+use Dancer;
+use Dancer::Plugin::DBIC;
+
+config->{engines}{JSON} = {
+    convert_blessed => 1,
+    allow_blessed => 1
+};
 set serializer => 'JSON';
 set logger => 'console';
-set log => 'core';
-set show_errors => 1;
 
-{ package Waack::DB; use parent 'DBIx::Class::Schema::Loader'; 
-__PACKAGE__->naming('current'); 
-__PACKAGE__->use_namespaces(1); 
-__PACKAGE__->loader_options( components => [ 'Helper::Row::ToJSON' ]);
+{ 
+    package Waack::DB;
+
+    use parent 'DBIx::Class::Schema::Loader';
+
+    __PACKAGE__->naming('current');
+    __PACKAGE__->use_namespaces(1);
+    __PACKAGE__->loader_options( components => [ 'Helper::Row::ToJSON' ]);
 }
 
-my $schema = Waack::DB->connect( 'dbi:SQLite:foo.db' );
+my $schema = Waack::DB->connect( @ARGV );
 
 # serialize ALL THE THINGS
-for my $column ( map {values %{ $_->columns_info} } map { $schema->source($_) } $schema->sources ) {
-    $column->{is_serializable} = 1;
-}
+$_->{is_serializable} = 1
+    for map {values $_->columns_info->%* } 
+        map { $schema->source($_) } 
+            $schema->sources ;
+
+get '/_tables' => sub { [ $schema->sources ] };
+
+get '/_schema' => sub {
+    my $trans  = SQL::Translator->new (
+        parser      => 'SQL::Translator::Parser::DBIx::Class',
+        parser_args => {
+         dbic_schema => $schema,
+     },
+    );
+
+    # warning SQL::Translator::Producer::HTML needs patching
+    my $output = request()->accept =~ m#text/html# ? 'HTML' : 'JSON';
+
+    content_type 'application/json' if $output eq 'JSON';
+
+    return $trans->translate( to => $output );
+};
 
 create_routes_for_table( $schema, $_ ) for $schema->sources;
 
-get '/_tables' => sub {
-    return [ $schema->sources ];
-};
 
-use SQL::Translator;
-
-get '/_schema.html' => sub {
-    my $trans  = SQL::Translator->new (
-        parser      => 'SQL::Translator::Parser::DBIx::Class',
-        parser_args => {
-         dbic_schema => $schema,
-     },
-     producer    => 'HTML',
-    ) or die SQL::Translator->error;
-
-    return $trans->translate || die $trans->error;
-};
-
-get '/_schema' => sub {
-    header 'Content-Type' => 'application/json';
-
-    my $trans  = SQL::Translator->new (
-        parser      => 'SQL::Translator::Parser::DBIx::Class',
-        parser_args => {
-         dbic_schema => $schema,
-     },
-     producer    => 'JSON',
-    ) or die SQL::Translator->error;
-
-    return $trans->translate || die $trans->error;
-};
-
-sub create_routes_for_table {
-my ( $schema, $table ) = @_;
+sub create_routes_for_table ( $schema, $table ) {
     my @primary_key = $schema->source($table)->primary_columns;
 
     # will be /<table name>/<key 1>/<key 2>
@@ -78,12 +70,13 @@ my ( $schema, $table ) = @_;
     };
 
     get "/$table/_schema" => sub {
-        # TODO clone
-        my %columns = %{ $schema->source($table)->columns_info };
-        for my $c ( values %columns ) {
-            /^_/ and delete $c->{$_} for keys %$c;
+        my $columns = clone $schema->source($table)->columns_info;
+
+        for my $c ( values $columns ) {
+            delete $c->{$_} for grep { /^_/ } keys $c;
         }
-        \%columns;
+
+        return $columns;
     };
 
     get $row_url => sub {
